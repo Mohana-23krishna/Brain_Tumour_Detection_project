@@ -275,29 +275,49 @@ def build_model(num_classes):
               metrics=['sparse_categorical_accuracy'])
     return m
  
-# ── FIX: Patched model loader ─────────────────────────────────────────────────
-# Strips 'batch_shape' and 'optional' kwargs that cause a TypeError when the
-# model was saved with a different Keras/TF version than what is installed here.
+# ── FIX: Robust model loader — handles Keras 2.x AND Keras 3.x saved models ──
+# Strategy:
+#   1. Try a clean load first (works when versions match perfectly)
+#   2. If that fails, patch InputLayer to strip unrecognised kwargs (Keras 2.x mismatch)
+#   3. If that also fails, raise a clear human-readable error
 @st.cache_resource
 def load_saved_model(path):
+    import tensorflow as tf
     from tensorflow.keras.models import load_model
-    from tensorflow.keras import layers as kl
  
-    original_from_config = kl.InputLayer.from_config
- 
-    @classmethod
-    def patched_from_config(cls, config):
-        config.pop("batch_shape", None)
-        config.pop("optional", None)
-        return original_from_config.__func__(cls, config)
- 
-    kl.InputLayer.from_config = patched_from_config
+    # ── Attempt 1: clean load ────────────────────────────────────────────────
     try:
-        model = load_model(path, compile=False)
-    finally:
-        # Always restore the original, even if loading fails
-        kl.InputLayer.from_config = original_from_config
-    return model
+        return load_model(path, compile=False)
+    except Exception:
+        pass  # fall through to patched attempt
+ 
+    # ── Attempt 2: patch InputLayer for Keras 2.x version skew ─────────────
+    try:
+        from tensorflow.keras import layers as kl
+        original_from_config = kl.InputLayer.from_config
+ 
+        @classmethod
+        def patched_from_config(cls, config):
+            config.pop("batch_shape", None)
+            config.pop("optional", None)
+            return original_from_config.__func__(cls, config)
+ 
+        kl.InputLayer.from_config = patched_from_config
+        try:
+            model = load_model(path, compile=False)
+            return model
+        finally:
+            # Always restore original, even if loading fails
+            kl.InputLayer.from_config = original_from_config
+ 
+    except Exception as final_err:
+        raise RuntimeError(
+            f"Could not load model after two attempts.\n\n"
+            f"Root cause: {final_err}\n\n"
+            f"Your model.h5 was saved with a different TensorFlow/Keras version "
+            f"than this deployment (TF {tf.__version__}). "
+            f"Please re-save the model locally using the same TF version."
+        )
  
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 t1, t2, t3, t4 = st.tabs(["🔍  Detect", "🏋️  Train", "📊  Evaluate", "🖼️  Dataset"])
@@ -369,8 +389,7 @@ with t1:
  
                 except Exception as e:
                     st.markdown(
-                        f'<div class="rbox r-red">❌ Model load failed: <code>{str(e)}</code><br><br>'
-                        f'Ensure your <code>model.h5</code> was saved with TensorFlow 2.12.</div>',
+                        f'<div class="rbox r-red">❌ Model load failed: <code>{str(e)}</code></div>',
                         unsafe_allow_html=True)
         else:
             st.markdown(
